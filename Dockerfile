@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     libxext6 \
     libxrender1 \
     libxcb1 \
+    libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
