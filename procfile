@@ -1,0 +1,1 @@
+web: python yolo_server.py
