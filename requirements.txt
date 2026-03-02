@@ -3,6 +3,7 @@ flask-cors
 ultralytics
 easyocr
 opencv-python-headless
+pillow
 numpy
 gunicorn
 
