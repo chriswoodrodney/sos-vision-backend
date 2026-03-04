@@ -4,7 +4,7 @@
 import os
 import base64
 import traceback
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -26,7 +26,8 @@ OCR_LANGS = os.environ.get("OCR_LANGS", "en").split(",")
 
 # Tunables
 YOLO_CONF = float(os.environ.get("YOLO_CONF", "0.30"))
-OCR_MIN_CONF = float(os.environ.get("OCR_MIN_CONF", "0.30"))  # lowered for noisy live camera frames
+OCR_MIN_CONF = float(os.environ.get("OCR_MIN_CONF", "0.15"))  # LOWERED for live camera frames
+OCR_MAX_LINES = int(os.environ.get("OCR_MAX_LINES", "30"))
 
 # ---------------- App init ----------------
 app = Flask(__name__, static_folder="build", static_url_path="")
@@ -69,97 +70,134 @@ def safe_cast_cls(box):
 
 def preprocess_for_ocr(img_bgr: np.ndarray) -> np.ndarray:
     """
-    Stronger OCR preprocessing for live camera frames:
-    - BGR -> GRAY
-    - upscale 2x (helps small text)
-    - denoise
+    Safer OCR preprocessing for packaging:
+    - upscale
+    - denoise lightly
     - contrast boost (CLAHE)
-    - adaptive threshold (often helps packaging text)
-    Returns a single-channel (gray/binary) image that EasyOCR can read.
+    NOTE: We DO NOT always threshold, because threshold can destroy colored/faint text.
     """
     try:
+        # Convert to gray
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-        # upscale
+        # Upscale (helps small text)
         gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
 
-        # denoise + edge preservation
-        gray = cv2.bilateralFilter(gray, 9, 75, 75)
+        # Light denoise
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-        # CLAHE contrast
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        # CLAHE contrast boost
+        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
         gray = clahe.apply(gray)
 
-        # adaptive threshold to make text stand out
-        th = cv2.adaptiveThreshold(
-            gray, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            31, 8
-        )
-        return th
+        return gray
     except Exception:
         return img_bgr
+
+
+def _clean_text(t: str) -> str:
+    t = str(t or "").strip()
+    t = " ".join(t.split())
+    return t
+
+
+def _looks_like_useful_text(t: str) -> bool:
+    """
+    Keep short but meaningful OCR outputs.
+    """
+    if not t:
+        return False
+    # must have at least 2 alnum chars
+    alnum = sum(ch.isalnum() for ch in t)
+    return alnum >= 2
 
 
 def extract_text_easyocr(img_for_ocr: np.ndarray) -> List[str]:
     """
     Runs EasyOCR and returns cleaned text list.
-    Filters by confidence and basic cleanup.
+    Filters by confidence, but allows lower confidence if text looks useful.
     """
     if reader is None:
         return []
 
-    ocr_texts: List[str] = []
+    out: List[str] = []
     try:
         raw_results = reader.readtext(img_for_ocr)
         for item in raw_results:
             if not item or len(item) < 2:
                 continue
-            text = str(item[1]).strip()
+
+            text = _clean_text(item[1])
             conf = float(item[2]) if len(item) > 2 and item[2] is not None else 0.0
 
-            if conf < OCR_MIN_CONF:
+            if not _looks_like_useful_text(text):
                 continue
 
-            # basic cleanup
-            text = " ".join(text.split())
-            if text:
-                ocr_texts.append(text)
+            # Keep high-confidence always; keep low-confidence if text seems informative
+            if conf >= OCR_MIN_CONF or len(text) >= 6:
+                out.append(text)
+
+        # Limit lines to avoid huge payloads
+        if len(out) > OCR_MAX_LINES:
+            out = out[:OCR_MAX_LINES]
+
     except Exception as oe:
         print("OCR inference error:", oe)
 
-    return ocr_texts
+    return out
+
+
+def merge_text_lists(a: List[str], b: List[str]) -> List[str]:
+    """
+    Merge, de-dup (case-insensitive), preserve order.
+    """
+    seen = set()
+    merged: List[str] = []
+    for t in (a or []) + (b or []):
+        key = _clean_text(t).lower()
+        if not key:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(_clean_text(t))
+    return merged
 
 
 def apply_ocr_keyword_mapping(texts: List[str], detections: List[Dict[str, Any]]) -> None:
     """
-    If OCR sees keywords, add/boost a detection label.
+    OCR keyword -> add/boost a detection label.
+    Also handles common OCR mistakes (0/O, 1/I, missing spaces).
     """
     try:
-        text_combined = " ".join(texts).lower()
+        raw = " ".join(texts).lower()
+
+        # normalize common OCR confusions
+        normalized = raw.replace("0", "o").replace("|", "i").replace("l", "l")
+        normalized = normalized.replace("-", " ").replace("_", " ")
+        normalized = " ".join(normalized.split())
 
         keyword_map = {
-            "gown": ["gown", "surgical gown", "isolation gown"],
-            "mask": ["mask", "n95", "respirator", "surgical mask", "kn95"],
+            "gown": ["gown", "isolation gown", "surgical gown"],
+            "mask": ["mask", "n95", "kn95", "respirator", "surgical mask"],
             "gloves": ["glove", "gloves", "latex", "nitrile", "vinyl"],
-            "bandage": ["bandage", "gauze", "dressing", "wound dressing"],
-            "syringe": ["syringe", "needle", "luer", "ml"],
-            "catheter": ["catheter", "foley", "urinary catheter"],
+            "bandage": ["bandage", "gauze", "dressing", "wound"],
+            "syringe": ["syringe", "needle", "luer", "ml", "cc"],
+            "catheter": ["catheter", "foley", "urinary"],
         }
 
         def has_label(lbl: str) -> bool:
             return any(str(d.get("label", "")).lower() == lbl for d in detections)
 
         for label, phrases in keyword_map.items():
-            if any(p in text_combined for p in phrases):
+            if any(p in normalized for p in phrases):
                 if not has_label(label):
                     detections.append({"label": label, "confidence": 0.95})
                 else:
-                    # boost existing
                     for d in detections:
                         if str(d.get("label", "")).lower() == label:
                             d["confidence"] = max(float(d.get("confidence", 0.0)), 0.95)
+
     except Exception as e:
         print("Hybrid logic error:", e)
 
@@ -216,7 +254,6 @@ def detect():
                         if cls_idx is None:
                             continue
 
-                        # resolve label name
                         label = str(cls_idx)
                         try:
                             names = getattr(model, "names", None)
@@ -232,11 +269,21 @@ def detect():
             except Exception as ye:
                 print("YOLO inference error:", ye)
 
-        # OCR inference (improved)
+        # OCR inference (DUAL PASS)
         ocr_texts: List[str] = []
         if reader is not None:
-            img_for_ocr = preprocess_for_ocr(img_bgr)
-            ocr_texts = extract_text_easyocr(img_for_ocr)
+            try:
+                # pass 1: original (often best for colored text)
+                ocr_raw = extract_text_easyocr(img_bgr)
+
+                # pass 2: preprocessed (often best for small/faint text)
+                img_proc = preprocess_for_ocr(img_bgr)
+                ocr_proc = extract_text_easyocr(img_proc)
+
+                ocr_texts = merge_text_lists(ocr_raw, ocr_proc)
+            except Exception as oe:
+                print("OCR inference error:", oe)
+                ocr_texts = []
 
         # Hybrid mapping: OCR text -> category label
         apply_ocr_keyword_mapping(ocr_texts, detections)
