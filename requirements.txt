@@ -1,12 +1,15 @@
-flask
-flask-cors
-ultralytics
-easyocr
-opencv-python-headless
-pillow
-numpy
-gunicorn
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+flask==3.0.3
+flask-cors==4.0.1
+gunicorn==22.0.0
+
+numpy==1.26.4
+pillow==10.4.0
+opencv-python-headless==4.10.0.84
 
 torch==2.2.2+cpu
 torchvision==0.17.2+cpu
---extra-index-url https://download.pytorch.org/whl/cpu
+
+ultralytics==8.3.21
+easyocr==1.7.1

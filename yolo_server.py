@@ -1,20 +1,18 @@
 # yolo_server.py
-# Full Flask app with /detect endpoint (YOLO + EasyOCR + CORS + robust error handling)
-
 import os
 import base64
 import traceback
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import numpy as np
+import cv2
+import torch
 
 from ultralytics import YOLO
 import easyocr
-import cv2
 
-# ---------------- Config ----------------
 ALLOWED_ORIGINS = [
     "https://sos-frontend-woad-gamma.vercel.app",
     "https://sos-frontend-git-main-chriswoodrodney.vercel.app",
@@ -24,16 +22,19 @@ ALLOWED_ORIGINS = [
 YOLO_WEIGHTS = os.environ.get("YOLO_WEIGHTS", "yolov8n.pt")
 OCR_LANGS = os.environ.get("OCR_LANGS", "en").split(",")
 
-# Tunables
 YOLO_CONF = float(os.environ.get("YOLO_CONF", "0.30"))
-OCR_MIN_CONF = float(os.environ.get("OCR_MIN_CONF", "0.15"))  # LOWERED for live camera frames
+OCR_MIN_CONF = float(os.environ.get("OCR_MIN_CONF", "0.08"))
 OCR_MAX_LINES = int(os.environ.get("OCR_MAX_LINES", "30"))
 
-# ---------------- App init ----------------
 app = Flask(__name__, static_folder="build", static_url_path="")
 CORS(app, resources={r"/detect": {"origins": ALLOWED_ORIGINS}})
 
-# ---------------- Model loading ----------------
+print("NumPy version:", np.__version__)
+print("OpenCV version:", cv2.__version__)
+print("Torch version:", torch.__version__)
+print("Torch CUDA available:", torch.cuda.is_available())
+
+
 try:
     model = YOLO(YOLO_WEIGHTS)
     try:
@@ -54,7 +55,7 @@ except Exception as e:
     print("Failed to initialize EasyOCR:", e)
     traceback.print_exc()
 
-# ---------------- Helpers ----------------
+
 def safe_cast_cls(box):
     try:
         cls_val = getattr(box, "cls", None)
@@ -70,139 +71,101 @@ def safe_cast_cls(box):
 
 def preprocess_for_ocr(img_bgr: np.ndarray) -> np.ndarray:
     """
-    Safer OCR preprocessing for packaging:
-    - upscale
-    - denoise lightly
-    - contrast boost (CLAHE)
-    NOTE: We DO NOT always threshold, because threshold can destroy colored/faint text.
+    OCR-friendly preprocessing:
+    - BGR -> GRAY
+    - upscale 2x
+    - denoise
+    - CLAHE contrast boost
+    - adaptive threshold
     """
     try:
-        # Convert to gray
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
-        # Upscale (helps small text)
         gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.fastNlMeansDenoising(gray, h=10)
 
-        # Light denoise
-        gray = cv2.GaussianBlur(gray, (3, 3), 0)
-
-        # CLAHE contrast boost
-        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         gray = clahe.apply(gray)
 
-        return gray
-    except Exception:
+        thresh = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31,
+            11,
+        )
+        return thresh
+    except Exception as e:
+        print("OCR preprocess error:", e)
         return img_bgr
 
 
 def _clean_text(t: str) -> str:
     t = str(t or "").strip()
-    t = " ".join(t.split())
-    return t
+    return " ".join(t.split())
 
 
-def _looks_like_useful_text(t: str) -> bool:
-    """
-    Keep short but meaningful OCR outputs.
-    """
-    if not t:
+def _is_meaningful_text(text: str) -> bool:
+    if not text:
         return False
-    # must have at least 2 alnum chars
-    alnum = sum(ch.isalnum() for ch in t)
-    return alnum >= 2
+
+    stripped = "".join(ch for ch in text if ch.isalnum())
+    return len(stripped) >= 2
 
 
-def extract_text_easyocr(img_for_ocr: np.ndarray) -> List[str]:
-    """
-    Runs EasyOCR and returns cleaned text list.
-    Filters by confidence, but allows lower confidence if text looks useful.
-    """
+def extract_text_easyocr(img: np.ndarray) -> List[str]:
     if reader is None:
         return []
 
     out: List[str] = []
     try:
-        raw_results = reader.readtext(img_for_ocr)
-        for item in raw_results:
+        results = reader.readtext(
+            img,
+            paragraph=False,
+            detail=1,
+            decoder="greedy",
+        )
+
+        for item in results:
             if not item or len(item) < 2:
                 continue
 
             text = _clean_text(item[1])
             conf = float(item[2]) if len(item) > 2 and item[2] is not None else 0.0
 
-            if not _looks_like_useful_text(text):
+            if not _is_meaningful_text(text):
                 continue
 
-            # Keep high-confidence always; keep low-confidence if text seems informative
-            if conf >= OCR_MIN_CONF or len(text) >= 6:
+            # keep more OCR output, even for lower-confidence live camera frames
+            if conf >= OCR_MIN_CONF or len(text) >= 2:
                 out.append(text)
 
-        # Limit lines to avoid huge payloads
         if len(out) > OCR_MAX_LINES:
             out = out[:OCR_MAX_LINES]
 
-    except Exception as oe:
-        print("OCR inference error:", oe)
+    except Exception as e:
+        print("OCR inference error:", e)
 
     return out
 
 
 def merge_text_lists(a: List[str], b: List[str]) -> List[str]:
-    """
-    Merge, de-dup (case-insensitive), preserve order.
-    """
     seen = set()
     merged: List[str] = []
+
     for t in (a or []) + (b or []):
-        key = _clean_text(t).lower()
-        if not key:
+        cleaned = _clean_text(t)
+        key = cleaned.lower()
+
+        if not cleaned or key in seen:
             continue
-        if key in seen:
-            continue
+
         seen.add(key)
-        merged.append(_clean_text(t))
+        merged.append(cleaned)
+
     return merged
 
 
-def apply_ocr_keyword_mapping(texts: List[str], detections: List[Dict[str, Any]]) -> None:
-    """
-    OCR keyword -> add/boost a detection label.
-    Also handles common OCR mistakes (0/O, 1/I, missing spaces).
-    """
-    try:
-        raw = " ".join(texts).lower()
-
-        # normalize common OCR confusions
-        normalized = raw.replace("0", "o").replace("|", "i").replace("l", "l")
-        normalized = normalized.replace("-", " ").replace("_", " ")
-        normalized = " ".join(normalized.split())
-
-        keyword_map = {
-            "gown": ["gown", "isolation gown", "surgical gown"],
-            "mask": ["mask", "n95", "kn95", "respirator", "surgical mask"],
-            "gloves": ["glove", "gloves", "latex", "nitrile", "vinyl"],
-            "bandage": ["bandage", "gauze", "dressing", "wound"],
-            "syringe": ["syringe", "needle", "luer", "ml", "cc"],
-            "catheter": ["catheter", "foley", "urinary"],
-        }
-
-        def has_label(lbl: str) -> bool:
-            return any(str(d.get("label", "")).lower() == lbl for d in detections)
-
-        for label, phrases in keyword_map.items():
-            if any(p in normalized for p in phrases):
-                if not has_label(label):
-                    detections.append({"label": label, "confidence": 0.95})
-                else:
-                    for d in detections:
-                        if str(d.get("label", "")).lower() == label:
-                            d["confidence"] = max(float(d.get("confidence", 0.0)), 0.95)
-
-    except Exception as e:
-        print("Hybrid logic error:", e)
-
-
-# ---------------- Routes ----------------
 @app.route("/", methods=["GET"])
 def serve_index():
     try:
@@ -213,15 +176,18 @@ def serve_index():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "yolo": bool(model is not None), "ocr": bool(reader is not None)})
+    return jsonify({
+        "status": "ok",
+        "yolo": bool(model is not None),
+        "ocr": bool(reader is not None),
+        "numpy_version": np.__version__,
+        "opencv_version": cv2.__version__,
+        "torch_version": torch.__version__,
+    })
 
 
 @app.route("/detect", methods=["POST"])
 def detect():
-    """
-    Expect JSON: { "imageBase64": "<base64-encoded-image-or-dataurl>" }
-    Returns JSON: { "detections": [...], "ocr_text": [...] }
-    """
     try:
         payload = request.get_json(force=True, silent=True) or {}
         image_b64 = payload.get("imageBase64", "")
@@ -230,17 +196,26 @@ def detect():
             image_b64 = image_b64.split(",")[-1]
 
         if not image_b64:
-            return jsonify({"error": "no imageBase64 provided", "detections": [], "ocr_text": []}), 400
+            return jsonify({
+                "error": "no imageBase64 provided",
+                "detections": [],
+                "ocr_text": []
+            }), 400
 
         try:
             img_bytes = base64.b64decode(image_b64)
             np_arr = np.frombuffer(img_bytes, np.uint8)
             img_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
             if img_bgr is None:
                 raise ValueError("cv2.imdecode returned None")
         except Exception as e:
             print("Image decode error:", e)
-            return jsonify({"error": "invalid image payload", "detections": [], "ocr_text": []}), 400
+            return jsonify({
+                "error": "invalid image payload",
+                "detections": [],
+                "ocr_text": []
+            }), 400
 
         detections: List[Dict[str, Any]] = []
 
@@ -248,6 +223,7 @@ def detect():
         if model is not None:
             try:
                 results = model(img_bgr, conf=YOLO_CONF, verbose=False)
+
                 for r in results:
                     for box in getattr(r, "boxes", []) or []:
                         cls_idx = safe_cast_cls(box)
@@ -265,35 +241,47 @@ def detect():
                             pass
 
                         confidence = float(getattr(box, "conf", 0.0))
-                        detections.append({"label": str(label), "confidence": round(confidence, 2)})
+                        detections.append({
+                            "label": str(label),
+                            "confidence": round(confidence, 2)
+                        })
+
             except Exception as ye:
                 print("YOLO inference error:", ye)
 
-        # OCR inference (DUAL PASS)
+        # OCR inference: return raw readable text only
         ocr_texts: List[str] = []
         if reader is not None:
             try:
-                # pass 1: original (often best for colored text)
-                ocr_raw = extract_text_easyocr(img_bgr)
+                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                ocr_raw = extract_text_easyocr(img_rgb)
 
-                # pass 2: preprocessed (often best for small/faint text)
                 img_proc = preprocess_for_ocr(img_bgr)
                 ocr_proc = extract_text_easyocr(img_proc)
 
                 ocr_texts = merge_text_lists(ocr_raw, ocr_proc)
-            except Exception as oe:
-                print("OCR inference error:", oe)
+
+                print("RAW OCR:", ocr_texts)
+                print("RAW DETECTIONS:", detections)
+
+            except Exception as e:
+                print("OCR inference error:", e)
                 ocr_texts = []
 
-        # Hybrid mapping: OCR text -> category label
-        apply_ocr_keyword_mapping(ocr_texts, detections)
-
-        return jsonify({"detections": detections, "ocr_text": ocr_texts}), 200
+        # response shape unchanged
+        return jsonify({
+            "detections": detections,
+            "ocr_text": ocr_texts
+        }), 200
 
     except Exception as e:
         print("Top-level /detect error:", e)
         traceback.print_exc()
-        return jsonify({"error": str(e), "detections": [], "ocr_text": []}), 500
+        return jsonify({
+            "error": str(e),
+            "detections": [],
+            "ocr_text": []
+        }), 500
 
 
 if __name__ == "__main__":
